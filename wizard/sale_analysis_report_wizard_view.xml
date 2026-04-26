@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026 SOPROMER - License LGPL-3.0 or later -->
+<odoo>
+
+    <record id="view_sale_analysis_report_wizard_form" model="ir.ui.view">
+        <field name="name">sale.analysis.report.wizard.form</field>
+        <field name="model">sale.analysis.report.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Rapport Analyse Ventes (Sage)">
+                <sheet>
+                    <div class="oe_title">
+                        <h1>Rapport Analyse Ventes (Format Sage)</h1>
+                        <p class="text-muted">
+                            Genere un rapport Excel des factures clients (hors POS)
+                            au format Sage 100 - 19 colonnes pour analyse TCD.
+                        </p>
+                    </div>
+                    <group>
+                        <group string="Periode">
+                            <field name="date_from"/>
+                            <field name="date_to"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                        </group>
+                        <group string="Options">
+                            <field name="include_draft"/>
+                        </group>
+                    </group>
+                    <group string="Filtres optionnels">
+                        <group>
+                            <field name="partner_ids" widget="many2many_tags"
+                                   options="{'no_create': True}"/>
+                            <field name="pricelist_ids" widget="many2many_tags"
+                                   options="{'no_create': True}"/>
+                        </group>
+                        <group>
+                            <field name="category_ids" widget="many2many_tags"
+                                   options="{'no_create': True}"/>
+                        </group>
+                    </group>
+                    <!-- Zone telechargement (visible apres generation) -->
+                    <group string="Telechargement"
+                           invisible="not report_xlsx_file">
+                        <field name="report_xlsx_file"
+                               filename="report_xlsx_filename"
+                               readonly="1"/>
+                        <field name="report_xlsx_filename" invisible="1"/>
+                    </group>
+                </sheet>
+                <footer>
+                    <button name="action_generate_report" type="object"
+                            string="Generer le rapport" class="btn-primary"
+                            icon="fa-file-excel-o"/>
+                    <button string="Annuler" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_sale_analysis_report_wizard" model="ir.actions.act_window">
+        <field name="name">Rapport Analyse Ventes (Sage)</field>
+        <field name="res_model">sale.analysis.report.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="target">new</field>
+    </record>
+
+</odoo>

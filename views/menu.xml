@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026 SOPROMER - License LGPL-3.0 or later -->
+<odoo>
+
+    <!--
+        Menu : Ventes > Analyse > Rapport Ventes Sage
+        Parent xmlid sale.menu_sale_report = menu "Analyse" natif Odoo 18.
+    -->
+    <menuitem id="menu_sale_analysis_report"
+              name="Rapport Ventes Sage"
+              parent="sale.menu_sale_report"
+              action="action_sale_analysis_report_wizard"
+              sequence="80"
+              groups="sales_team.group_sale_salesman,account.group_account_invoice"/>
+
+</odoo>
