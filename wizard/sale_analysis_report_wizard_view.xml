@@ -11,9 +11,19 @@
                     <div class="oe_title">
                         <h1>Rapport Analyse Ventes (Format Sage)</h1>
                         <p class="text-muted">
-                            Genere un rapport Excel des factures clients (hors POS)
-                            au format Sage 100 - 19 colonnes pour analyse TCD.
+                            Genere un rapport Excel format Sage 100 - 19 colonnes
+                            pour analyse TCD.
                         </p>
+                    </div>
+                    <div class="alert alert-info" role="alert">
+                        <strong>Sources incluses :</strong>
+                        <ul class="mb-1">
+                            <li>Factures clients (out_invoice) et avoirs (out_refund) - postees ou brouillons (option)</li>
+                            <li>Devis non transformes (etat Brouillon, Envoye)</li>
+                            <li>Bons de commande non encore factures totalement (qty_to_invoice &gt; 0)</li>
+                        </ul>
+                        <em>Anti-doublon : les commandes completement facturees sont comptees une seule fois (cote facture).</em>
+                        <br/><em>POS : les factures issues du POS sont exclues.</em>
                     </div>
                     <group>
                         <group string="Periode">

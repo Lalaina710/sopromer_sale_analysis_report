@@ -5,15 +5,21 @@
 Genere un rapport Excel reproduisant le rapport Sage "Ventes" (15k+ lignes)
 pour analyse TCD cote client.
 
-Granularite : 1 ligne par account.move.line (lignes de type 'product').
-Source     : factures clients (out_invoice + out_refund) HORS POS.
+Granularite : 1 ligne par account.move.line (lignes de type 'product')
+              + 1 ligne par sale.order.line non encore facturee.
+Sources    : factures clients (out_invoice + out_refund) HORS POS
+              + devis non transformes (draft / sent)
+              + bons de commande non encore factures totalement.
 Devise     : MGA (mono-devise SOPROMER).
 
 Architecture :
-    - _build_domain()           : domain ORM avec exclusion POS
+    - _build_domain()           : domain ORM factures avec exclusion POS
     - _get_pos_move_ids()       : factures issues du POS (a exclure)
-    - _get_report_data()        : extraction + transformation
-    - _row_from_line(line)      : mapping 1 line -> dict 19 colonnes
+    - _build_sale_order_domain(): domain ORM SO devis + BC non factures
+    - _get_sale_order_lines()   : recordset SO lines a inclure (anti-doublon)
+    - _get_report_data()        : extraction + transformation (merge sources)
+    - _row_from_line(line)      : mapping 1 invoice line -> dict 19 colonnes
+    - _row_from_sale_line(line) : mapping 1 sale.order.line -> dict 19 colonnes
     - _compute_totals(rows)     : totaux globaux
     - action_generate_report()  : genere XLSX et retourne URL download
 """
@@ -187,40 +193,155 @@ class SaleAnalysisReportWizard(models.TransientModel):
 
         return domain
 
+    def _build_sale_order_domain(self):
+        """Construit le domain ORM pour rechercher les lignes de SO non facturees.
+
+        Filtres applique :
+          - Etat : draft, sent (devis), sale, done (BC) - cancel exclu
+          - Periode : order_id.date_order dans [date_from, date_to]
+          - Societe : order_id.company_id
+          - display_type vide (exclure sections/notes)
+          - product_id obligatoire
+          - Hors POS (si champ pos_order_id present sur sale.order)
+          - Clients / pricelists / familles (optionnels)
+
+        Note : le filtre qty_to_invoice > 0 (etats sale/done) ne peut pas
+        s'exprimer en domain car qty_to_invoice est un champ calcule sur la
+        ligne et `product_uom_qty - qty_invoiced` n'est pas un domain valide.
+        On filtre apres le search() dans _get_sale_order_lines().
+
+        Returns:
+            list: domain Odoo standard pour sale.order.line
+        """
+        self.ensure_one()
+        domain = [
+            ('order_id.state', 'in', ('draft', 'sent', 'sale', 'done')),
+            ('order_id.date_order', '>=', self.date_from),
+            ('order_id.date_order', '<=', self.date_to),
+            ('order_id.company_id', '=', self.company_id.id),
+            ('display_type', '=', False),
+            ('product_id', '!=', False),
+        ]
+
+        # Hors POS : si le module POS est installe, sale.order.pos_order_ids
+        # peut exister (extension v17/18). On filtre defensive seulement si
+        # le champ existe pour eviter une exception sur installations sans POS.
+        if 'pos_order_ids' in self.env['sale.order']._fields:
+            # pos_order_ids est un One2many : '=', False -> aucune commande POS liee
+            domain.append(('order_id.pos_order_ids', '=', False))
+        elif 'pos_order_id' in self.env['sale.order']._fields:
+            domain.append(('order_id.pos_order_id', '=', False))
+
+        # Filtres optionnels
+        if self.partner_ids:
+            domain.append(('order_id.partner_id', 'in', self.partner_ids.ids))
+        if self.category_ids:
+            domain.append(('product_id.categ_id', 'child_of', self.category_ids.ids))
+        if self.pricelist_ids:
+            # Pricelist peut etre defini sur la SO directement OU heritee du partner
+            partners = self.env['res.partner'].search([
+                ('property_product_pricelist', 'in', self.pricelist_ids.ids),
+            ])
+            domain += [
+                '|',
+                ('order_id.pricelist_id', 'in', self.pricelist_ids.ids),
+                ('order_id.partner_id', 'in', partners.ids or [0]),
+            ]
+
+        return domain
+
+    def _get_sale_order_lines(self):
+        """Recupere les sale.order.line a inclure dans le rapport.
+
+        Filtre anti-doublon :
+            - draft / sent : tout est inclus (rien n'est facture)
+            - sale / done  : seules les lignes avec qty_remaining > 0 sont
+                             incluses (le reste est deja cote factures)
+
+        Returns:
+            sale.order.line: recordset filtre, trie par date_order/order/id
+        """
+        self.ensure_one()
+        SaleOrderLine = self.env['sale.order.line']
+        domain = self._build_sale_order_domain()
+        # Tri sur order_id (FK) puis id : safe quel que soit le statut stored
+        # de date_order (related) sur sale.order.line. Le tri final par date
+        # est refait dans _get_report_data() apres merge des 2 sources.
+        lines = SaleOrderLine.search(domain, order='order_id, id')
+
+        # Filtrer les lignes totalement facturees (etats sale/done uniquement)
+        # pour eviter les doublons avec les lignes facture deja prises.
+        kept_ids = []
+        for line in lines:
+            state = line.order_id.state
+            if state in ('draft', 'sent'):
+                kept_ids.append(line.id)
+            else:  # sale / done
+                qty_remaining = line.product_uom_qty - line.qty_invoiced
+                # Tolerance arrondi : > 0.0 strict pourrait inclure 0.0001
+                # On garde > 0 pour matcher la semantique qty_to_invoice
+                if qty_remaining > 0:
+                    kept_ids.append(line.id)
+        return SaleOrderLine.browse(kept_ids)
+
     def _get_report_data(self):
         """Centralise extraction + transformation des donnees du rapport.
+
+        Fusionne 2 sources :
+          - account.move.line (factures - source historique)
+          - sale.order.line   (devis + BC non factures - nouvelle source)
 
         Returns:
             dict: {
                 'company': res.company,
                 'date_from': date,
                 'date_to': date,
-                'rows': list[dict],   # 1 dict par ligne de facture
-                'totals': dict,       # totaux globaux
+                'rows': list[dict],   # 1 dict par ligne (toutes sources)
+                'totals': dict,       # totaux globaux (toutes sources)
                 'filters_summary': str,
                 'print_date': datetime,
             }
         """
         self.ensure_one()
-        domain = self._build_domain()
 
-        # Recherche + tri stable (date, piece, id)
+        # ---------------------------------------------------------------
+        # Source 1 : factures (out_invoice + out_refund), hors POS
+        # ---------------------------------------------------------------
+        domain = self._build_domain()
         AccountMoveLine = self.env['account.move.line']
-        lines = AccountMoveLine.search(domain, order='invoice_date, move_id, id')
+        invoice_lines = AccountMoveLine.search(domain, order='invoice_date, move_id, id')
 
         # Prefetch pour eviter N+1 queries (essentiel sur 15k lignes)
-        # Le simple acces a un champ many2one declenche le prefetch automatique
-        # sur tout le recordset, donc on amorce explicitement les acces.
-        lines.mapped('move_id.partner_id.property_product_pricelist.name')
-        lines.mapped('product_id.categ_id.complete_name')
-        lines.mapped('product_id.standard_price')
+        invoice_lines.mapped('move_id.partner_id.property_product_pricelist.name')
+        invoice_lines.mapped('product_id.categ_id.complete_name')
+        invoice_lines.mapped('product_id.standard_price')
+
+        # ---------------------------------------------------------------
+        # Source 2 : devis + BC non factures (sale.order.line)
+        # ---------------------------------------------------------------
+        so_lines = self._get_sale_order_lines()
+        so_lines.mapped('order_id.partner_id.property_product_pricelist.name')
+        so_lines.mapped('order_id.pricelist_id.name')
+        so_lines.mapped('product_id.categ_id.complete_name')
+        so_lines.mapped('product_id.standard_price')
 
         _logger.info(
-            "Rapport analyse ventes : %d lignes a traiter (periode %s - %s, societe %s)",
-            len(lines), self.date_from, self.date_to, self.company_id.name,
+            "Rapport analyse ventes : %d lignes facture + %d lignes SO non facturees "
+            "(periode %s - %s, societe %s)",
+            len(invoice_lines), len(so_lines),
+            self.date_from, self.date_to, self.company_id.name,
         )
 
-        rows = [self._row_from_line(line) for line in lines]
+        # ---------------------------------------------------------------
+        # Fusion + tri
+        # ---------------------------------------------------------------
+        rows = [self._row_from_line(line) for line in invoice_lines]
+        rows.extend(self._row_from_sale_line(line) for line in so_lines)
+
+        # Tri stable par date puis num_piece (garantit un ordre lisible
+        # quand on melange les 2 sources).
+        rows.sort(key=lambda r: (r['date_vente'] or date.min, r['num_piece']))
+
         totals = self._compute_totals(rows)
 
         return {
@@ -332,6 +453,104 @@ class SaleAnalysisReportWizard(models.TransientModel):
             'categ_tarifaire_client': pricelist_name,
         }
 
+    def _row_from_sale_line(self, line):
+        """Transforme une sale.order.line en dict ligne rapport (19 colonnes Sage).
+
+        Equivalent SO de _row_from_line(). Couvre les devis (draft/sent) et
+        les BC non encore factures totalement (sale/done avec qty_remaining > 0).
+
+        Mapping cle :
+            4. Type Document : "Devis" / "Devis envoye" / "Bon de commande"
+            6. Document en cours : "OUI" toujours (tout SO non facture est en cours)
+            7-9. CA HT / CA TTC / Qte : portion non facturee (ratio applique
+                 aux montants pour les BC partiellement factures)
+            10. Prix Revient Total : standard_price * qty_remaining
+            11. Marge : ca_ht - prix_revient_total
+            18-19. Classement / Categorie tarifaire : pricelist_id de la SO
+                   en priorite, sinon property_product_pricelist du partner
+
+        Args:
+            line: sale.order.line record
+
+        Returns:
+            dict: ligne du rapport prete pour XLSX
+        """
+        order = line.order_id
+        product = line.product_id
+        partner = order.partner_id
+
+        state_map = {
+            'draft': _("Devis"),
+            'sent': _("Devis envoye"),
+            'sale': _("Bon de commande"),
+            'done': _("Bon de commande"),
+        }
+        type_doc = state_map.get(order.state, order.state or '')
+
+        # Calcul ratio non facture (anti-doublon avec source factures)
+        if order.state in ('draft', 'sent'):
+            qty_remaining = line.product_uom_qty
+            ratio = 1.0
+        else:  # sale / done
+            qty_remaining = line.product_uom_qty - line.qty_invoiced
+            ratio = (qty_remaining / line.product_uom_qty) if line.product_uom_qty else 1.0
+
+        ca_ht = line.price_subtotal * ratio
+        ca_ttc = line.price_total * ratio
+        std_price = product.standard_price if product else 0.0
+        prix_revient_total = std_price * qty_remaining
+        marge = ca_ht - prix_revient_total
+
+        # Famille produit
+        categ = product.categ_id if product else False
+        code_famille = categ.complete_name if categ else ''
+        intitule_famille = categ.name if categ else ''
+
+        # Categorie tarifaire : pricelist SO prioritaire, sinon partner
+        pricelist = order.pricelist_id or (
+            partner.property_product_pricelist if partner else False
+        )
+        pricelist_name = pricelist.name if pricelist else ''
+
+        # N compte client
+        if partner.ref:
+            num_compte = partner.ref
+        elif partner:
+            num_compte = "C%07d" % partner.id
+        else:
+            num_compte = ''
+
+        # Designation
+        if product:
+            designation = product.display_name
+        else:
+            designation = line.name or ''
+
+        # Date : on utilise la date du jour de date_order (datetime -> date)
+        date_vente = order.date_order.date() if order.date_order else False
+
+        return {
+            'date_vente': date_vente,
+            'nb_documents': 1,
+            'num_piece': order.name or '',
+            'type_document': type_doc,
+            'reference': order.client_order_ref or '',
+            'document_en_cours': _("OUI"),
+            'ca_ht': ca_ht,
+            'ca_ttc': ca_ttc,
+            'qte_vendue': qty_remaining,
+            'prix_revient_total': prix_revient_total,
+            'marge': marge,
+            'ref_article': product.default_code if product else '',
+            'designation': designation,
+            'code_famille': code_famille,
+            'intitule_famille': intitule_famille,
+            'num_compte_client': num_compte,
+            'intitule_client': partner.name or '',
+            'classement_client': pricelist_name,
+            'categ_tarifaire_client': pricelist_name,
+        }
+
     @staticmethod
     def _compute_totals(rows):
         """Calcule les totaux globaux du rapport sur colonnes numeriques."""
@@ -377,7 +596,8 @@ class SaleAnalysisReportWizard(models.TransientModel):
         data = self._get_report_data()
         if not data['rows']:
             raise UserError(
-                _("Aucune ligne de facture trouvee pour les criteres selectionnes.")
+                _("Aucune ligne (facture, devis ou bon de commande non facture) "
+                  "trouvee pour les criteres selectionnes.")
             )
 
         XlsxBuilder = self.env['report.sale.analysis.xlsx']
